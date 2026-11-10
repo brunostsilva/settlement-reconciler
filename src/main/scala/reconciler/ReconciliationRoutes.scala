@@ -59,7 +59,7 @@ final class ReconciliationRoutes(ledgerDir: Path):
             val ndjson = Sharding
               .reconcile(FileIO.fromPath(ledgerFile), FileIO.fromPath(upload), shards)
               .map(output => ByteString(JsonLines.encode(output) + "\n"))
-              .watchTermination() { (notUsed, done) =>
+              .watchTermination { (notUsed, done) =>
                 done.onComplete(_ => Files.deleteIfExists(upload))(using ExecutionContext.parasitic)
                 notUsed
               }
