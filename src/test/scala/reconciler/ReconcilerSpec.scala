@@ -92,6 +92,22 @@ class ReconcilerSpec extends StreamSuite:
     }
   }
 
+  test("a run stopped by an unsorted file never emits the summary, so its partial results can be told apart") {
+    // tx-2 is in the ledger, but out of order: by the time that's detected, missing_in_ledger(tx-2)
+    // may already be out. The missing summary is what marks those results as invalid.
+    val ledger     = csv("tx-1,1.00,BRL", "tx-3,3.00,BRL", "tx-2,2.00,BRL")
+    val settlement = csv("tx-2,2.00,BRL", "tx-3,3.00,BRL")
+    Reconciler
+      .reconcile(ledger, settlement)
+      .map[Either[Throwable, Output]](Right(_))
+      .recover { case error => Left(error) }
+      .runWith(Sink.seq)
+      .map { outputs =>
+        assert(outputs.last.left.exists(_.isInstanceOf[UnsortedInputException]), outputs)
+        assert(!outputs.exists(_.exists(_.isInstanceOf[Output.End])), outputs)
+      }
+  }
+
   test("reconcile ends with a summary of counts and amounts, after every result") {
     val ledger     = csv("tx-1,10.00,BRL", "tx-2,20.00,BRL", "tx-3,30.00,BRL")
     val settlement = csv("tx-1,10.00,BRL", "tx-2,25.00,BRL", "tx-4,40.00,BRL", "bad")
