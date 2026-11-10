@@ -83,7 +83,7 @@ object Sharding:
           // concatLazy: the shards are only read once both files have been split without error.
           Reconciler
             .summarized(issues.concatLazy(shardResults))
-            .watchTermination() { (notUsed, done) =>
+            .watchTermination { (notUsed, done) =>
               done.onComplete(_ => deleteRecursively(dir))(using ExecutionContext.parasitic)
               notUsed
             }

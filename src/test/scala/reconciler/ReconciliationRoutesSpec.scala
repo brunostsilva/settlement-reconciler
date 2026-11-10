@@ -36,7 +36,12 @@ class ReconciliationRoutesSpec extends StreamSuite:
       .withoutSizeLimit()
       .dataBytes
       .via(Framing.delimiter(ByteString("\n"), 64 * 1024, allowTruncation = true))
-      .map(line => parse(line.utf8String).fold(error => fail(s"invalid JSON line: $error"), identity))
+      .map(line =>
+        parse(line.utf8String).fold(
+          error => fail(s"${response.status} response, invalid JSON line: ${line.utf8String} ($error)"),
+          identity
+        )
+      )
 
   private def ndjson(response: HttpResponse): Future[Seq[Json]] = runToSeq(lines(response))
 
@@ -60,6 +65,22 @@ class ReconciliationRoutesSpec extends StreamSuite:
       val types = lines.init.flatMap(_.hcursor.get[String]("type").toOption)
       assertEquals(types.count(_ == "discrepancy"), 2)
       assertEquals(types.count(_ == "rejected"), 1)
+  }
+
+  test("results are sent in chunks of whole lines, many lines per chunk") {
+    val count = 20_000L
+    val dir   = Files.createTempDirectory("chunked-ledger")
+    val route = ReconciliationRoutes(dir).route
+    for
+      _        <- Generator.ledger(count).runWith(FileIO.toPath(dir.resolve(s"ledger-$date.csv")))
+      upload    = HttpEntity(ContentTypes.`text/csv(UTF-8)`, Generator.settlement(count))
+      response <- post(route, s"/settlements/$date/reconciliation", upload)
+      chunks   <- runToSeq(response.entity.withoutSizeLimit().dataBytes)
+    yield
+      val lines = chunks.map(_.count(_ == '\n'.toByte)).sum
+      assert(chunks.forall(_.lastOption.contains('\n'.toByte)), "a chunk ends with a whole line")
+      assert(chunks.forall(_.length <= ReconciliationRoutes.MaxChunkSize), chunks.map(_.length).max)
+      assert(chunks.size * 10 < lines, s"${chunks.size} chunks for $lines lines")
   }
 
   test("an invalid date is a 400 and a date without a ledger export is a 404") {
@@ -108,8 +129,10 @@ class ReconciliationRoutesSpec extends StreamSuite:
       assertEquals(lineCount, transactions + 1)
   }
 
-  test("over real HTTP, a settlement file larger than the 8 MB request limit is reconciled in full") {
-    val count = 500_000L // about 12 MB of settlement file, uploaded as a stream
+  test("over real HTTP, a settlement file above the 8 MB and 100,000-chunk request limits is reconciled in full") {
+    // About 12 MB of settlement file, uploaded as a stream with one chunk per line: 500,000 chunks,
+    // past both Pekko HTTP's default request size limit and its default chunk count limit.
+    val count = 500_000L
     val dir   = Files.createTempDirectory("large-ledger")
     for
       _       <- Generator.ledger(count).runWith(FileIO.toPath(dir.resolve(s"ledger-$date.csv")))
