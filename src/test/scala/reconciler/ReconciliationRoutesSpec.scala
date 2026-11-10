@@ -1,7 +1,9 @@
 package reconciler
 
+import java.net.Socket
+import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Path}
-import scala.concurrent.Future
+import scala.concurrent.{blocking, Future}
 import scala.concurrent.duration.*
 import io.circe.Json
 import io.circe.parser.parse
@@ -87,3 +89,37 @@ class ReconciliationRoutesSpec extends StreamSuite:
       assertEquals(summaryOf(last).hcursor.get[Long]("matched").toOption, Some(expected.matched))
       assertEquals(summaryOf(last).hcursor.get[Long]("missingInLedger").toOption, Some(expected.missingInLedger))
   }
+
+  test("a client that sends the whole upload before reading the response still gets the full result") {
+    // The response is about 3x the upload: if the server reconciled straight from the upload, a client
+    // that only reads after sending everything would fill the network buffers and both sides would
+    // wait for each other until the idle timeout.
+    val count = 200_000L // about 5 MB of upload
+    val dir   = Files.createTempDirectory("half-duplex")
+    for
+      _        <- Generator.ledger(count).runWith(FileIO.toPath(dir.resolve(s"ledger-$date.csv")))
+      body     <- Generator.settlement(count).runFold(ByteString.empty)(_ ++ _)
+      binding  <- Http().newServerAt("127.0.0.1", 0).bind(Route.toFunction(ReconciliationRoutes(dir).route))
+      response <- Future(blocking(sendWholeRequestThenRead(binding.localAddress.getPort, body)))
+      _        <- binding.unbind()
+    yield
+      assert(response.startsWith("HTTP/1.1 200"), response.take(200))
+      assert(response.contains("\"end\":true"), response.takeRight(500))
+  }
+
+  /** Writes the whole request, body included, before reading a single byte of the response, like a
+    * half-duplex HTTP/1.1 client (e.g. Python's requests).
+    */
+  private def sendWholeRequestThenRead(port: Int, body: ByteString): String =
+    val socket = new Socket("127.0.0.1", port)
+    try
+      socket.setSoTimeout(60_000)
+      val head =
+        s"POST /settlements/$date/reconciliation HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: text/csv\r\n" +
+          s"Content-Length: ${body.length}\r\nConnection: close\r\n\r\n"
+      val out = socket.getOutputStream
+      out.write(head.getBytes(UTF_8))
+      out.write(body.toArray)
+      out.flush()
+      new String(socket.getInputStream.readAllBytes(), UTF_8)
+    finally socket.close()
