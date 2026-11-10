@@ -32,7 +32,11 @@ object Reconciler:
     * summary.
     */
   def reconcile(ledger: Source[ByteString, ?], settlement: Source[ByteString, ?]): Source[Output, NotUsed] =
-    results(ledger, settlement)
+    summarized(results(ledger, settlement))
+
+  /** Each result as a line, then the summary of all of them, only if `results` completes without error. */
+  private[reconciler] def summarized(results: Source[Result, ?]): Source[Output, NotUsed] =
+    results
       .map(Option(_))
       .concat(Source.single(None)) // the end marker: only reached when upstream completes without error
       .statefulMap[Summary, Output](() => Summary.empty)(
@@ -43,6 +47,7 @@ object Reconciler:
         // statefulMap also calls this when upstream fails, so the summary can't be emitted here.
         _ => None
       )
+      .mapMaterializedValue(_ => NotUsed)
 
   /** One result per transaction (and per unusable line), in transaction id order for the matched
     * ones. Fails with [[UnsortedInputException]] if a file isn't sorted.
@@ -76,21 +81,24 @@ object Reconciler:
       SourceShape(out.out)
     })
 
+  private def checked(side: Side): Flow[ByteString, Either[Result, Tagged], NotUsed] =
+    ordered(side).map(_.map(record => Tagged(side, record)))
+
   /** Parses a file and checks its order: a repeated transaction id becomes a `Duplicate` (only the
     * first one is reconciled) and an id going backwards stops the run, since the merge-join can only
     * pair up records of sorted files.
     */
-  private def checked(side: Side): Flow[ByteString, Either[Result, Tagged], NotUsed] =
+  private[reconciler] def ordered(side: Side): Flow[ByteString, Either[Result, Record], NotUsed] =
     Csv
       .records(side)
-      .statefulMap[Option[String], Either[Result, Tagged]](() => None)(
+      .statefulMap[Option[String], Either[Result, Record]](() => None)(
         {
           case (previous, Left(issue)) => (previous, Left(issue))
           case (previous @ Some(previousId), Right((record, line))) if record.transactionId == previousId =>
             (previous, Left(Result.Duplicate(side, line, record)))
           case (Some(previousId), Right((record, line))) if record.transactionId < previousId =>
             throw UnsortedInputException(side, line, record.transactionId, previousId)
-          case (_, Right((record, _))) => (Some(record.transactionId), Right(Tagged(side, record)))
+          case (_, Right((record, _))) => (Some(record.transactionId), Right(record))
         },
         _ => None
       )

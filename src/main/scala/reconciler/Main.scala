@@ -42,7 +42,8 @@ private def exitWhenDone(task: Future[?])(using system: ActorSystem): Nothing =
   Await.ready(system.terminate(), 30.seconds)
   sys.exit(status)
 
-/** `sbt "runMain reconciler.Reconcile <ledger.csv> <settlement.csv>"`: prints the results as NDJSON.
+/** `sbt "runMain reconciler.Reconcile <ledger.csv> <settlement.csv> [shards]"`: prints the results as
+  * NDJSON, reconciled in `shards` shards (1 to 16, default 1; see [[Sharding]]).
   *
   * Exits with 1 if the run fails (e.g. an unsorted file): the lines already printed must then be
   * discarded, and only a run ending with the `{"end":true,...}` line is valid. Exits with 2 on wrong
@@ -50,18 +51,23 @@ private def exitWhenDone(task: Future[?])(using system: ActorSystem): Nothing =
   */
 object Reconcile:
 
-  def main(args: Array[String]): Unit = args match
-    case Array(ledger, settlement) =>
-      given system: ActorSystem = ActorSystem("reconcile")
-      exitWhenDone(
-        Reconciler
-          .reconcile(FileIO.fromPath(Path.of(ledger)), FileIO.fromPath(Path.of(settlement)))
-          .map(JsonLines.encode)
-          .runForeach(println)
-      )
-    case _ =>
-      System.err.println("usage: Reconcile <ledger.csv> <settlement.csv>")
-      sys.exit(2)
+  def main(args: Array[String]): Unit =
+    val parsed = args match
+      case Array(ledger, settlement)      => Sharding.parse(None).map(shards => (ledger, settlement, shards))
+      case Array(ledger, settlement, raw) => Sharding.parse(Some(raw)).map(shards => (ledger, settlement, shards))
+      case _                                 => Left("usage: Reconcile <ledger.csv> <settlement.csv> [shards]")
+    parsed match
+      case Right((ledger, settlement, shards)) =>
+        given system: ActorSystem = ActorSystem("reconcile")
+        exitWhenDone(
+          Sharding
+            .reconcile(FileIO.fromPath(Path.of(ledger)), FileIO.fromPath(Path.of(settlement)), shards)
+            .map(JsonLines.encode)
+            .runForeach(println)
+        )
+      case Left(error) =>
+        System.err.println(error)
+        sys.exit(2)
 
 /** `sbt "runMain reconciler.GenerateSample [dir] [count] [date]"`: writes `ledger-{date}.csv` and
   * `settlement-{date}.csv` with `count` transactions each (default `generated`, 1,000,000, today),

@@ -72,6 +72,42 @@ class ReconciliationRoutesSpec extends StreamSuite:
       assertEquals(missing.status, StatusCodes.NotFound)
   }
 
+  test("shards must be a number from 1 to 16") {
+    val route = ReconciliationRoutes(ledgerDir()).route
+    Future
+      .traverse(Seq("0", "17", "two")) { shards =>
+        post(route, s"/settlements/$date/reconciliation?shards=$shards", HttpEntity.Empty).map(response => shards -> response.status)
+      }
+      .map(statuses => statuses.foreach((shards, status) => assertEquals(status, StatusCodes.BadRequest, shards)))
+  }
+
+  test("over real HTTP, a reconciliation in 2 shards streams every result, then the expected summary") {
+    val count = 200_000L
+    val dir   = Files.createTempDirectory("sharded-ledger")
+    for
+      _        <- Generator.ledger(count).runWith(FileIO.toPath(dir.resolve(s"ledger-$date.csv")))
+      binding  <- Http().newServerAt("127.0.0.1", 0).bind(Route.toFunction(ReconciliationRoutes(dir).route))
+      uri       = s"http://127.0.0.1:${binding.localAddress.getPort}/settlements/$date/reconciliation?shards=2"
+      upload    = HttpEntity(ContentTypes.`text/csv(UTF-8)`, Generator.settlement(count))
+      response <- Http().singleRequest(HttpRequest(HttpMethods.POST, Uri(uri), entity = upload))
+      // Only the line count and the last line are kept, not every result.
+      (lineCount, last) <- lines(response).runFold((0L, Json.Null))((acc, line) => (acc._1 + 1, line))
+      _                 <- binding.unbind()
+    yield
+      assertEquals(response.status, StatusCodes.OK)
+      assertEquals(response.entity.contentType.mediaType.toString, "application/x-ndjson")
+      val expected = Generator.expectedSummary(count)
+      val summary  = summaryOf(last).hcursor
+      assertEquals(summary.get[Long]("matched").toOption, Some(expected.matched))
+      assertEquals(summary.get[Long]("discrepancies").toOption, Some(expected.discrepancies))
+      assertEquals(summary.get[Long]("missingInSettlement").toOption, Some(expected.missingInSettlement))
+      assertEquals(summary.get[Long]("missingInLedger").toOption, Some(expected.missingInLedger))
+      assertEquals(summary.get[BigDecimal]("matchedAmount").toOption, Some(expected.matchedAmount.toBigDecimal))
+      // One line per transaction from both shards, then the summary.
+      val transactions = expected.matched + expected.discrepancies + expected.missingInSettlement + expected.missingInLedger
+      assertEquals(lineCount, transactions + 1)
+  }
+
   test("over real HTTP, a settlement file larger than the 8 MB request limit is reconciled in full") {
     val count = 500_000L // about 12 MB of settlement file, uploaded as a stream
     val dir   = Files.createTempDirectory("large-ledger")

@@ -69,9 +69,54 @@ the alternative would be holding every result back until the end. So a run that 
 never emits the summary, the HTTP response then has no `end` line, and the CLI exits with status 1:
 whatever was received must be discarded.
 
+## Sharding
+
+A single run uses one CPU for the merge-join. `?shards=N` (or the CLI's third argument) splits the
+reconciliation into N independent ones by transaction id: both files are split with the same
+function, `hash(transaction_id) % N`, so the two records of a transaction always land in the same
+shard. It runs in two phases, like a database's **Grace hash join**:
+
+```mermaid
+flowchart LR
+    L[ledger file] --> PL[parse + check order]
+    S[settlement file] --> PS[parse + check order]
+    PL -- "hash(id) % N" --> F0[(shard 0 files)]
+    PL --> F1[(shard 1 files)]
+    PS -- "hash(id) % N" --> F0
+    PS --> F1
+    PL -- rejected / duplicate --> OUT((results))
+    PS -- rejected / duplicate --> OUT
+    F0 --> R0[merge-join 0] --> OUT
+    F1 --> R1[merge-join 1] --> OUT
+    OUT --> SUM[summary<br/>of every shard]
+```
+
+1. **Split:** each file is read once, parsed and checked exactly as in a single run (rejected and
+   duplicate lines come out right away, with their line numbers in the original file; an unsorted
+   file stops the run here), and each valid record is written to its shard's file, in order.
+2. **Reconcile:** the N pairs of shard files are reconciled **in parallel** by the same merge-join,
+   and their results are merged into one stream. Pekko fuses a whole stream, sub-streams included,
+   into a single actor (one thread at a time), so each shard's merge-join, like each file's split,
+   is marked `.async` to get an actor of its own.
+3. **Summarize:** the summary adds up the results of every shard. Counting is associative, so the
+   order in which shards finish doesn't matter, and the summary is the same as a single run's.
+
+**Why files, not N in-memory streams:** splitting each file into N streams feeding N merge-joins can
+deadlock. Shard 0's merge-join holds a ledger record and waits for the next settlement record of shard
+0; that record is behind settlement records of shard 1, whose buffer is full because shard 1's
+merge-join waits for a ledger record, which is behind the one shard 0 holds. No fixed buffer size
+prevents it for every pair of files. Writing a shard file never waits for anything, so each file is
+split at its own pace, still with constant memory.
+
+The trade-offs: results from different shards are interleaved (no longer in transaction id order),
+and the files are written to disk once more. On one machine the split phase reads each file
+sequentially, so the gain is in the merge-join; the bigger point is that each pair of shard files is a
+self-contained unit of work, which is what would let shards run in separate processes or machines. The
+shard files are deleted when the run ends, however it ends.
+
 ## API
 
-### `POST /settlements/{date}/reconciliation`
+### `POST /settlements/{date}/reconciliation[?shards=N]`
 
 The request body is the acquirer's settlement file for `date` (`YYYY-MM-DD`). The ledger side is the
 company's own export, read from `LEDGER_DIR/ledger-{date}.csv`. The response is **streamed as NDJSON**
@@ -81,6 +126,9 @@ The upload is first written to a temporary file (streamed, with constant memory,
 limit), then reconciled from disk while the response streams; the file is deleted when the response
 ends. That keeps the request and the response independent, so it works with clients that send the
 whole body before reading the response, such as Python's `requests`.
+
+`shards` (1 to 16, default 1) reconciles in that many shards, in parallel (see
+[Sharding](#sharding)): same results and summary, interleaved in another order.
 
 ```bash
 sbt run    # starts the server on port 8080, with sample-data as LEDGER_DIR
@@ -108,7 +156,7 @@ branch, so their position relative to the paired results may vary.
 | Status | When |
 |---|---|
 | `200` | The reconciliation streams; it ends with the `{"end":true,…}` line |
-| `400` | Invalid date |
+| `400` | Invalid date, or `shards` not a number from 1 to 16 |
 | `404` | No ledger export for that date |
 
 A `200` response **without** the final `end` line was cut short, e.g. by an unsorted file, and its
@@ -128,6 +176,9 @@ sbt run                                    # the HTTP server (LEDGER_DIR=sample-
 
 # Reconcile two local files from the command line (NDJSON on stdout; exit status 1 if the run fails)
 sbt "runMain reconciler.Reconcile sample-data/ledger-2026-11-10.csv sample-data/settlement-2026-11-10.csv"
+
+# The same in 4 shards, reconciled in parallel (the third argument, 1 to 16)
+sbt "runMain reconciler.Reconcile sample-data/ledger-2026-11-10.csv sample-data/settlement-2026-11-10.csv 4"
 
 # Generate a large pair of files (here 5 million transactions each, ~120 MB per file), streamed to disk
 sbt "runMain reconciler.GenerateSample generated 5000000 2026-11-10"
@@ -171,6 +222,10 @@ missing from the ledger, every 97th settled one cent off), so the summary can be
   fill. Storing the upload first (streamed, constant memory) costs some latency, since results start
   after the upload, and works with every client. The default 8 MB request size limit is lifted for
   this route only (`withoutSizeLimit`), since the body is never held in memory.
+- **Sharding by transaction id, through files.** The shard key is the transaction id, the only key
+  that keeps both halves of a transaction together. Shards are written to files rather than streamed
+  in memory, which avoids a deadlock between shards (see [Sharding](#sharding)), and the summary is a
+  sum, so partial summaries combine in any order.
 - **Scriptable CLI.** `Reconcile` exits with 0 only when the run completes, 1 when it fails and 2 on
   wrong usage, so `Reconcile ... > results.ndjson && upload results.ndjson` never ships a partial run.
 - **Money as integer cents.** Amounts are parsed into an opaque `Money` type backed by `Long`, so
@@ -190,13 +245,20 @@ sbt test
   an empty file, duplicates and rejected lines alongside the reconciliation, paired results in id
   order, an unsorted file failing with its line and never emitting the summary, the summary, and the
   sample files.
+- **`ShardingSpec`:** ids spread over every shard; both files split at the same time, in separate
+  actors (a barrier that only opens if they run concurrently); a line right at the 1,024-byte limit
+  still accepted when its shard file is read back; 2, 3 and 4 shards giving exactly the same results
+  as a single run (line numbers of duplicate and rejected lines included) and the same summary, on the
+  sample files and on 20,000 generated transactions; an unsorted file stopping a sharded run before
+  any shard is reconciled; the shard files deleted after a successful and a failed run.
 - **`LargeFileSpec`:** 500,000 generated transactions per file reconciled to exactly the expected
   summary, and an **endless** pair of files reconciled lazily (taking 5 results ends the run), which
   would hang if any stage collected its input.
 - **`ReconciliationRoutesSpec`:** the NDJSON response and its summary, 400 and 404, and over real
   HTTP: a ~12 MB streamed settlement upload (above the default 8 MB limit) reconciled in full, and a
   raw-socket client that sends its whole ~5 MB upload before reading anything still getting the
-  full result.
+  full result, `shards` validation, and a reconciliation of 200,000 generated transactions in
+  **2 shards** over real HTTP, returning one line per transaction and the expected summary.
 
 ## Tech stack
 
