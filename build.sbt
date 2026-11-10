@@ -17,6 +17,9 @@ lazy val root = (project in file("."))
     ),
     // `sbt run` starts the HTTP server; the CLI and the sample generator are run with runMain.
     Compile / run / mainClass := Some("reconciler.ReconcilerServer"),
+    // Run in a forked JVM: the CLI tools exit with a status code, which must end their own JVM
+    // (and fail the sbt command) rather than sbt's.
+    Compile / run / fork := true,
     // The tests start an actor system and, in one suite, a real HTTP server: run them in a forked
     // JVM so they don't share sbt's.
     Test / fork := true

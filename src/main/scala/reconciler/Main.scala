@@ -2,8 +2,9 @@ package reconciler
 
 import java.nio.file.{Files, Path}
 import java.time.LocalDate
-import scala.concurrent.Future
-import scala.util.{Failure, Success}
+import scala.concurrent.{Await, Future}
+import scala.concurrent.duration.*
+import scala.util.{Failure, Success, Try}
 import org.apache.pekko.actor.ActorSystem
 import org.apache.pekko.http.scaladsl.Http
 import org.apache.pekko.http.scaladsl.server.Route
@@ -29,25 +30,42 @@ object ReconcilerServer:
         system.terminate()
     }
 
-/** `sbt "runMain reconciler.Reconcile <ledger.csv> <settlement.csv>"`: prints the results as NDJSON. */
+/** Runs a command-line task to completion and exits with a status scripts can rely on: 0 on success,
+  * 1 on failure (with the error on stderr), after shutting the actor system down.
+  */
+private def exitWhenDone(task: Future[?])(using system: ActorSystem): Nothing =
+  val status = Try(Await.result(task, Duration.Inf)) match
+    case Success(_) => 0
+    case Failure(error) =>
+      System.err.println(s"failed: ${error.getMessage}")
+      1
+  Await.ready(system.terminate(), 30.seconds)
+  sys.exit(status)
+
+/** `sbt "runMain reconciler.Reconcile <ledger.csv> <settlement.csv>"`: prints the results as NDJSON.
+  *
+  * Exits with 1 if the run fails (e.g. an unsorted file): the lines already printed must then be
+  * discarded, and only a run ending with the `{"end":true,...}` line is valid. Exits with 2 on wrong
+  * usage.
+  */
 object Reconcile:
 
   def main(args: Array[String]): Unit = args match
     case Array(ledger, settlement) =>
       given system: ActorSystem = ActorSystem("reconcile")
-      import system.dispatcher
-      Reconciler
-        .reconcile(FileIO.fromPath(Path.of(ledger)), FileIO.fromPath(Path.of(settlement)))
-        .map(JsonLines.encode)
-        .runForeach(println)
-        .recover { case error => System.err.println(s"reconciliation failed: ${error.getMessage}") }
-        .onComplete(_ => system.terminate())
+      exitWhenDone(
+        Reconciler
+          .reconcile(FileIO.fromPath(Path.of(ledger)), FileIO.fromPath(Path.of(settlement)))
+          .map(JsonLines.encode)
+          .runForeach(println)
+      )
     case _ =>
       System.err.println("usage: Reconcile <ledger.csv> <settlement.csv>")
+      sys.exit(2)
 
 /** `sbt "runMain reconciler.GenerateSample [dir] [count] [date]"`: writes `ledger-{date}.csv` and
   * `settlement-{date}.csv` with `count` transactions each (default `generated`, 1,000,000, today),
-  * streamed to disk, ready for the server or the CLI.
+  * streamed to disk, ready for the server or the CLI. Exits with 1 if writing fails.
   */
 object GenerateSample:
 
@@ -61,16 +79,13 @@ object GenerateSample:
     import system.dispatcher
     val ledgerFile     = dir.resolve(s"ledger-$date.csv")
     val settlementFile = dir.resolve(s"settlement-$date.csv")
-    Future
-      .sequence(
-        List(
-          Generator.ledger(count).runWith(FileIO.toPath(ledgerFile)),
-          Generator.settlement(count).runWith(FileIO.toPath(settlementFile))
+    exitWhenDone(
+      Future
+        .sequence(
+          List(
+            Generator.ledger(count).runWith(FileIO.toPath(ledgerFile)),
+            Generator.settlement(count).runWith(FileIO.toPath(settlementFile))
+          )
         )
-      )
-      .onComplete { result =>
-        result match
-          case Success(_)     => println(s"Wrote $ledgerFile and $settlementFile ($count transactions)")
-          case Failure(error) => System.err.println(s"generation failed: ${error.getMessage}")
-        system.terminate()
-      }
+        .map(_ => println(s"Wrote $ledgerFile and $settlementFile ($count transactions)"))
+    )
