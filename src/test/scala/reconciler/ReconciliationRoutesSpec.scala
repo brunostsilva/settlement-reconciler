@@ -113,8 +113,10 @@ class ReconciliationRoutesSpec extends StreamSuite:
       assertEquals(lineCount, transactions + 1)
   }
 
-  test("over real HTTP, a settlement file larger than the 8 MB request limit is reconciled in full") {
-    val count = 500_000L // about 12 MB of settlement file, uploaded as a stream
+  test("over real HTTP, a settlement file above the 8 MB and 100,000-chunk request limits is reconciled in full") {
+    // About 12 MB of settlement file, uploaded as a stream with one chunk per line: 500,000 chunks,
+    // past both Pekko HTTP's default request size limit and its default chunk count limit.
+    val count = 500_000L
     val dir   = Files.createTempDirectory("large-ledger")
     for
       _       <- Generator.ledger(count).runWith(FileIO.toPath(dir.resolve(s"ledger-$date.csv")))

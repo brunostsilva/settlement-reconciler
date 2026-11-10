@@ -224,7 +224,10 @@ missing from the ledger, every 97th settled one cent off), so the summary can be
   response after sending the whole body would deadlock with the server once the network buffers
   fill. Storing the upload first (streamed, constant memory) costs some latency, since results start
   after the upload, and works with every client. The default 8 MB request size limit is lifted for
-  this route only (`withoutSizeLimit`), since the body is never held in memory.
+  this route only (`withoutSizeLimit`), since the body is never held in memory. Pekko HTTP 2.0 also
+  caps a chunked request at 100,000 chunks, which a client streaming in small chunks reaches with a
+  few MB; that cap is applied by the connection's parser, before routing, so it's lifted in
+  `application.conf`: a chunk costs at least a byte of upload, so it adds no work beyond the size.
 - **Sharding by transaction id, through files.** The shard key is the transaction id, the only key
   that keeps both halves of a transaction together. Shards are written to files rather than streamed
   in memory, which avoids a deadlock between shards (see [Sharding](#sharding)), and the summary is a
@@ -261,7 +264,8 @@ sbt test
   line, at least the version it requires), so a bump of one without the other fails with a clear
   message.
 - **`ReconciliationRoutesSpec`:** the NDJSON response and its summary, 400 and 404, and over real
-  HTTP: a ~12 MB streamed settlement upload (above the default 8 MB limit) reconciled in full, and a
+  HTTP: a ~12 MB settlement upload streamed in 500,000 chunks (above the default 8 MB and 100,000-chunk
+  limits) reconciled in full, and a
   raw-socket client that sends its whole ~5 MB upload before reading anything still getting the
   full result, `shards` validation, and a reconciliation of 200,000 generated transactions in
   **2 shards** over real HTTP, returning one line per transaction and the expected summary.
