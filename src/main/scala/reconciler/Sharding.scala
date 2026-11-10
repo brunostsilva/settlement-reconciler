@@ -81,7 +81,7 @@ object Sharding:
           Reconciler
             .summarized(issues.concatLazy(shardResults))
             .watchTermination() { (notUsed, done) =>
-              done.onComplete(_ => deleteRecursively(dir))(ExecutionContext.parasitic)
+              done.onComplete(_ => deleteRecursively(dir))(using ExecutionContext.parasitic)
               notUsed
             }
         }

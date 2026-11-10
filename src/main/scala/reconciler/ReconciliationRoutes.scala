@@ -60,7 +60,7 @@ final class ReconciliationRoutes(ledgerDir: Path):
               .reconcile(FileIO.fromPath(ledgerFile), FileIO.fromPath(upload), shards)
               .map(output => ByteString(JsonLines.encode(output) + "\n"))
               .watchTermination() { (notUsed, done) =>
-                done.onComplete(_ => Files.deleteIfExists(upload))(ExecutionContext.parasitic)
+                done.onComplete(_ => Files.deleteIfExists(upload))(using ExecutionContext.parasitic)
                 notUsed
               }
             complete(HttpResponse(entity = HttpEntity(ReconciliationRoutes.NdJson, ndjson)))
