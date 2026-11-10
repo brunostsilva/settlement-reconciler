@@ -1,0 +1,12 @@
+target/
+project/target/
+project/project/
+.bsp/
+.idea/
+.vscode/
+.metals/
+.bloop/
+*.iml
+.DS_Store
+# Large files written by GenerateSample
+generated/
