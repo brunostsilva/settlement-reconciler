@@ -1,0 +1,7 @@
+transaction_id,amount,currency
+tx-0001,120.00,BRL
+tx-0002,89.90,BRL
+tx-0003,45.00,BRL
+tx-0004,300.00,BRL
+tx-0006,15.50,BRL
+tx-0007,99.99,USD
