@@ -68,12 +68,15 @@ object Sharding:
           val ledgerWritten      = Promise[Unit]()
           val settlementWritten  = Promise[Unit]()
 
-          val issues = split(ledger, Side.Ledger, ledgerFiles, ledgerWritten)
-            .merge(split(settlement, Side.Settlement, settlementFiles, settlementWritten))
+          // Pekko fuses the stages of a stream into one actor, sub-streams included, so on their own
+          // these would all run on one thread: `.async` gives each file's split, and each shard's
+          // merge-join, an actor of its own, which is what makes them run in parallel.
+          val issues = split(ledger, Side.Ledger, ledgerFiles, ledgerWritten).async
+            .merge(split(settlement, Side.Settlement, settlementFiles, settlementWritten).async)
           val shardResults = Source.futureSource(ledgerWritten.future.zip(settlementWritten.future).map { _ =>
             Source(0 until shards).flatMapMerge(
               shards,
-              shard => Reconciler.results(FileIO.fromPath(ledgerFiles(shard)), FileIO.fromPath(settlementFiles(shard)))
+              shard => Reconciler.results(FileIO.fromPath(ledgerFiles(shard)), FileIO.fromPath(settlementFiles(shard))).async
             )
           })
 
@@ -124,9 +127,15 @@ object Sharding:
         NotUsed
       }
 
-  /** A record as a line of a shard file, in the same format as the input files (without the header). */
+  /** A record as a line of a shard file, in the same format as the input files (without the header).
+    *
+    * The amount is written in its shortest form (`1`, `1.5`, `1.05`), so the line is never longer than
+    * the one it was parsed from: a line that fit in [[Csv.MaxLineLength]] when the file was split still
+    * fits when its shard is read back.
+    */
   private def render(record: Record): ByteString =
-    ByteString(s"${record.transactionId},${record.amount.toBigDecimal},${record.currency}\n")
+    val amount = record.amount.toBigDecimal.bigDecimal.stripTrailingZeros.toPlainString
+    ByteString(s"${record.transactionId},$amount,${record.currency}\n")
 
   private def deleteRecursively(dir: Path): Unit =
     Try {

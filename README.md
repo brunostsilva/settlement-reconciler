@@ -95,7 +95,9 @@ flowchart LR
    duplicate lines come out right away, with their line numbers in the original file; an unsorted
    file stops the run here), and each valid record is written to its shard's file, in order.
 2. **Reconcile:** the N pairs of shard files are reconciled **in parallel** by the same merge-join,
-   and their results are merged into one stream.
+   and their results are merged into one stream. Pekko fuses a whole stream, sub-streams included,
+   into a single actor (one thread at a time), so each shard's merge-join, like each file's split,
+   is marked `.async` to get an actor of its own.
 3. **Summarize:** the summary adds up the results of every shard. Counting is associative, so the
    order in which shards finish doesn't matter, and the summary is the same as a single run's.
 
@@ -243,7 +245,9 @@ sbt test
   an empty file, duplicates and rejected lines alongside the reconciliation, paired results in id
   order, an unsorted file failing with its line and never emitting the summary, the summary, and the
   sample files.
-- **`ShardingSpec`:** ids spread over every shard; 2, 3 and 4 shards giving exactly the same results
+- **`ShardingSpec`:** ids spread over every shard; both files split at the same time, in separate
+  actors (a barrier that only opens if they run concurrently); a line right at the 1,024-byte limit
+  still accepted when its shard file is read back; 2, 3 and 4 shards giving exactly the same results
   as a single run (line numbers of duplicate and rejected lines included) and the same summary, on the
   sample files and on 20,000 generated transactions; an unsorted file stopping a sharded run before
   any shard is reconciled; the shard files deleted after a successful and a failed run.

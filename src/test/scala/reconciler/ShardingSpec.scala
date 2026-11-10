@@ -1,6 +1,7 @@
 package reconciler
 
 import java.nio.file.{Files, Path}
+import java.util.concurrent.{CyclicBarrier, TimeUnit}
 import scala.concurrent.{blocking, Future}
 import scala.concurrent.duration.*
 import scala.util.Using
@@ -53,6 +54,31 @@ class ShardingSpec extends StreamSuite:
     yield
       assertEquals(sorted(sharded.init), sorted(single.init))
       assertEquals(sharded.last, Output.End(Generator.expectedSummary(count)))
+  }
+
+  test("both files are split at the same time, each in its own actor") {
+    // Each file's first chunk waits for the other's: if both splits ran in the same actor, the first
+    // one to arrive would block it, the other could never arrive, and the barrier would time out.
+    val barrier = new CyclicBarrier(2)
+    def meetingTheOther(file: Source[ByteString, ?]) = file.map { chunk =>
+      barrier.await(10, TimeUnit.SECONDS)
+      chunk
+    }
+    val ledger     = meetingTheOther(csv("tx-1,1.00,BRL", "tx-2,2.00,BRL"))
+    val settlement = meetingTheOther(csv("tx-1,1.00,BRL", "tx-3,3.00,BRL"))
+    runToSeq(Sharding.reconcile(ledger, settlement, 2)).map { outputs =>
+      assertEquals(outputs.size, 4) // tx-1, tx-2 and tx-3, then the summary
+    }
+  }
+
+  test("a line just under the length limit is still accepted when its shard file is read back") {
+    // 1,024 bytes with an integer amount: written as "1.00" it would no longer fit when read back.
+    val id     = "tx-" + "9" * (Csv.MaxLineLength - "tx-,1,BRL".length)
+    val line   = s"$id,1,BRL"
+    assertEquals(line.length, Csv.MaxLineLength)
+    runToSeq(Sharding.reconcile(csv(line), csv(line), 2)).map { outputs =>
+      assertEquals(outputs.init, Seq(Output.Line(Result.Matched(Record(id, money("1"), "BRL")))))
+    }
   }
 
   test("the shard files are deleted once the run completes") {
