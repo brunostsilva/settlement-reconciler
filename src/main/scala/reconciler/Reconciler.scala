@@ -28,12 +28,20 @@ object Reconciler:
     */
   private given Ordering[Tagged] = Ordering.by((tagged: Tagged) => (tagged.record.transactionId, tagged.side.ordinal))
 
-  /** Every result, then a summary once both files have been read. */
+  /** Every result, then a summary once both files have been read. A failed run never emits the
+    * summary.
+    */
   def reconcile(ledger: Source[ByteString, ?], settlement: Source[ByteString, ?]): Source[Output, NotUsed] =
     results(ledger, settlement)
+      .map(Option(_))
+      .concat(Source.single(None)) // the end marker: only reached when upstream completes without error
       .statefulMap[Summary, Output](() => Summary.empty)(
-        (summary, result) => (summary.add(result), Output.Line(result)),
-        summary => Some(Output.End(summary))
+        {
+          case (summary, Some(result)) => (summary.add(result), Output.Line(result))
+          case (summary, None)         => (summary, Output.End(summary))
+        },
+        // statefulMap also calls this when upstream fails, so the summary can't be emitted here.
+        _ => None
       )
 
   /** One result per transaction (and per unusable line), in transaction id order for the matched
