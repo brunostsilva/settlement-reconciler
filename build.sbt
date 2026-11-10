@@ -1,7 +1,7 @@
 ThisBuild / scalaVersion := "3.10.0"
 ThisBuild / version      := "0.1.0"
 
-val pekkoVersion     = "1.7.1"
+val pekkoVersion     = "2.0.0"
 val pekkoHttpVersion = "1.4.2"
 val circeVersion     = "0.14.17"
 
