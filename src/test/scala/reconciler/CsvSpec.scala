@@ -44,6 +44,28 @@ class CsvSpec extends StreamSuite:
     }
   }
 
+  test("a line longer than the limit is rejected, even split across chunks, and the next lines still parse") {
+    val longLine = "tx-2," + "9" * 5000 + ",BRL"
+    val text     = s"${Csv.Header}\ntx-1,1.00,BRL\n$longLine\ntx-3,3.00,BRL\n"
+    val bytes    = Source(text.grouped(100).map(ByteString(_)).toList)
+    parse(bytes).map { parsed =>
+      assertEquals(
+        parsed,
+        Seq(
+          Right((Record("tx-1", money("1.00"), "BRL"), 2L)),
+          Left(Result.Rejected(Side.Settlement, 3, s"line longer than ${Csv.MaxLineLength} bytes")),
+          Right((Record("tx-3", money("3.00"), "BRL"), 4L))
+        )
+      )
+    }
+  }
+
+  test("an overlong last line without a newline is rejected too") {
+    parse(Source.single(ByteString(s"${Csv.Header}\ntx-1," + "1" * 2000))).map { parsed =>
+      assertEquals(parsed, Seq(Left(Result.Rejected(Side.Settlement, 2, s"line longer than ${Csv.MaxLineLength} bytes"))))
+    }
+  }
+
   test("a file without the header parses its first line as a record") {
     parse(Source.single(ByteString("tx-1,10.00,BRL\n"))).map { parsed =>
       assertEquals(parsed, Seq(Right((Record("tx-1", money("10.00"), "BRL"), 1L))))

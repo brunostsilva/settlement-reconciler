@@ -1,7 +1,8 @@
 package reconciler
 
+import scala.annotation.tailrec
 import org.apache.pekko.NotUsed
-import org.apache.pekko.stream.scaladsl.{Flow, Framing}
+import org.apache.pekko.stream.scaladsl.Flow
 import org.apache.pekko.util.ByteString
 
 /** Turns the bytes of a ledger or settlement file into records, one line at a time.
@@ -14,25 +15,63 @@ object Csv:
 
   val Header = "transaction_id,amount,currency"
 
-  /** Longest accepted line: a longer one fails the run instead of being buffered without limit. */
+  /** Longest accepted line. A longer one is rejected, and never held in memory beyond this size. */
   val MaxLineLength = 1024
 
   private val CurrencyCode = "[A-Z]{3}".r
 
-  /** Splits bytes into lines numbered from 1. The last line may have no trailing newline. */
-  val lines: Flow[ByteString, (String, Long), NotUsed] =
+  /** Bytes of the line being read; `tooLong` once it has gone past [[MaxLineLength]], after which
+    * its bytes are dropped until the next newline.
+    */
+  private final case class LineState(buffer: ByteString, tooLong: Boolean)
+
+  private val Empty = LineState(ByteString.empty, tooLong = false)
+
+  /** Splits bytes into lines numbered from 1: `Right(line)`, or `Left(reason)` for a line longer than
+    * [[MaxLineLength]] (a bad line is reported, it doesn't stop the run). The last line may have no
+    * trailing newline.
+    */
+  val lines: Flow[ByteString, (Either[String, String], Long), NotUsed] =
     Flow[ByteString]
-      .via(Framing.delimiter(ByteString("\n"), MaxLineLength, allowTruncation = true))
-      .map(_.utf8String.stripSuffix("\r"))
+      .statefulMap[LineState, Vector[Either[String, String]]](() => Empty)(
+        (state, chunk) => split(state, chunk, Vector.empty),
+        state => Option.when(state.tooLong || state.buffer.nonEmpty)(Vector(finish(state)))
+      )
+      .mapConcat(identity)
       .zipWithIndex
       .map((line, index) => (line, index + 1))
 
-  /** Parses every line of a file. The header and blank lines are skipped; a malformed line becomes a
-    * `Rejected` result instead of failing the whole run.
+  @tailrec
+  private def split(
+      state: LineState,
+      rest: ByteString,
+      lines: Vector[Either[String, String]]
+  ): (LineState, Vector[Either[String, String]]) =
+    val newline = rest.indexOf('\n'.toByte)
+    if newline < 0 then
+      if state.tooLong then (state, lines)
+      else
+        val buffer = state.buffer ++ rest
+        if buffer.length > MaxLineLength then (LineState(ByteString.empty, tooLong = true), lines)
+        else (LineState(buffer, tooLong = false), lines)
+    else
+      val line =
+        if state.tooLong then finish(state)
+        else finish(LineState(state.buffer ++ rest.take(newline), tooLong = false))
+      split(Empty, rest.drop(newline + 1), lines :+ line)
+
+  private def finish(state: LineState): Either[String, String] =
+    if state.tooLong || state.buffer.length > MaxLineLength then Left(s"line longer than $MaxLineLength bytes")
+    else Right(state.buffer.utf8String.stripSuffix("\r"))
+
+  /** Parses every line of a file. The header and blank lines are skipped; a malformed or overlong
+    * line becomes a `Rejected` result instead of failing the whole run.
     */
   def records(side: Side): Flow[ByteString, Either[Result, (Record, Long)], NotUsed] =
     lines.collect {
-      case (line, number) if !(number == 1 && line == Header) && line.trim.nonEmpty => parse(side, line, number)
+      case (Left(reason), number) => Left(Result.Rejected(side, number, reason))
+      case (Right(line), number) if !(number == 1 && line == Header) && line.trim.nonEmpty =>
+        parse(side, line, number)
     }
 
   def parse(side: Side, line: String, number: Long): Either[Result, (Record, Long)] =
