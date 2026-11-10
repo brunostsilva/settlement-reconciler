@@ -218,7 +218,9 @@ missing from the ledger, every 97th settled one cent off), so the summary can be
   makes the whole reconciliation meaningless, fails the run.
 - **Results stream out as they're found.** The HTTP response is NDJSON over chunked transfer
   encoding, so a client sees discrepancies while the files are still being read, and the server
-  never builds the full result in memory.
+  never builds the full result in memory. Lines are sent in chunks of whole lines, up to 64 KB and
+  at least every 100 ms, rather than one chunk per line: that saves a chunk header per line, and
+  keeps large results under the 100,000-chunk limit Pekko HTTP 2.0 clients apply by default.
 - **The upload goes to disk before it's reconciled.** Reconciling straight from the request body
   would tie request and response together through backpressure: a client that only reads the
   response after sending the whole body would deadlock with the server once the network buffers
@@ -263,7 +265,8 @@ sbt test
 - **`DependencyVersionsSpec`:** Pekko HTTP accepts the Pekko version on the classpath (same major
   line, at least the version it requires), so a bump of one without the other fails with a clear
   message.
-- **`ReconciliationRoutesSpec`:** the NDJSON response and its summary, 400 and 404, and over real
+- **`ReconciliationRoutesSpec`:** the NDJSON response and its summary, results sent in chunks of
+  whole lines (many lines per chunk, none over 64 KB), 400 and 404, and over real
   HTTP: a ~12 MB settlement upload streamed in 500,000 chunks (above the default 8 MB and 100,000-chunk
   limits) reconciled in full, and a
   raw-socket client that sends its whole ~5 MB upload before reading anything still getting the

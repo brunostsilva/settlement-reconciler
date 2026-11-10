@@ -3,12 +3,14 @@ package reconciler
 import java.nio.file.{Files, Path}
 import java.time.LocalDate
 import scala.concurrent.ExecutionContext
+import scala.concurrent.duration.*
 import scala.util.{Failure, Success, Try}
 import org.apache.pekko.http.scaladsl.model.*
 import org.apache.pekko.http.scaladsl.server.Directives.*
 import org.apache.pekko.http.scaladsl.server.Route
+import org.apache.pekko.NotUsed
 import org.apache.pekko.stream.Materializer
-import org.apache.pekko.stream.scaladsl.FileIO
+import org.apache.pekko.stream.scaladsl.{FileIO, Source}
 import org.apache.pekko.util.ByteString
 
 /** `POST /settlements/{date}/reconciliation[?shards=N]`
@@ -56,9 +58,8 @@ final class ReconciliationRoutes(ledgerDir: Path):
         val stored = entity.withoutSizeLimit().dataBytes.runWith(FileIO.toPath(upload))
         onComplete(stored) {
           case Success(_) =>
-            val ndjson = Sharding
-              .reconcile(FileIO.fromPath(ledgerFile), FileIO.fromPath(upload), shards)
-              .map(output => ByteString(JsonLines.encode(output) + "\n"))
+            val ndjson = ReconciliationRoutes
+              .ndjson(Sharding.reconcile(FileIO.fromPath(ledgerFile), FileIO.fromPath(upload), shards))
               .watchTermination { (notUsed, done) =>
                 done.onComplete(_ => Files.deleteIfExists(upload))(using ExecutionContext.parasitic)
                 notUsed
@@ -72,6 +73,22 @@ final class ReconciliationRoutes(ledgerDir: Path):
     }
 
 object ReconciliationRoutes:
+
+  /** Largest chunk of a response, and the longest a result waits for its chunk to fill up. */
+  val MaxChunkSize: Int             = 64 * 1024
+  val MaxChunkDelay: FiniteDuration = 100.millis
+
+  /** The outputs as NDJSON, in chunks of whole lines: up to [[MaxChunkSize]] bytes, sent at least
+    * every [[MaxChunkDelay]], so results still arrive as they're found. One chunk per line would cost
+    * a chunk header per line, and a large reconciliation would go past the chunk count limit that
+    * Pekko HTTP 2.0 clients apply by default (100,000 chunks).
+    */
+  def ndjson(outputs: Source[Output, ?]): Source[ByteString, NotUsed] =
+    outputs
+      .map(output => ByteString(JsonLines.encode(output) + "\n"))
+      .groupedWeightedWithin(MaxChunkSize, MaxChunkDelay)(_.length.toLong)
+      .map(_.foldLeft(ByteString.empty)(_ ++ _))
+      .mapMaterializedValue(_ => NotUsed)
 
   val NdJson: ContentType.WithFixedCharset =
     MediaType.applicationWithFixedCharset("x-ndjson", HttpCharsets.`UTF-8`).toContentType
