@@ -201,8 +201,11 @@ missing from the ledger, every 97th settled one cent off), so the summary can be
   needs a commercial license, and new versions are downloaded from Akka's own repository with a
   token. Pekko is the Apache 2.0 fork, on Maven Central, with native Scala 3 support and practically
   the same API (`org.apache.pekko.stream` instead of `akka.stream`), so Source/Flow/Sink, the Graph
-  DSL and backpressure work the same. This project uses Pekko 1.7 with Pekko HTTP 1.4, which is
-  built against the Pekko 1.x line (Pekko 2.0 has no matching Pekko HTTP release yet).
+  DSL and backpressure work the same. This project uses Pekko 2.0 with Pekko HTTP 2.0.0-M2: Pekko
+  HTTP has no final 2.x release yet, and its latest milestone is built against a Pekko 2.0 milestone.
+  Pekko HTTP checks the Pekko version it runs on when it starts, and accepts the final 2.0.0;
+  `DependencyVersionsSpec` makes that check part of the test suite, and the HTTP tests run a real
+  server and client on this pair of versions.
 - **Merge-join over sorted files, not a lookup map.** Building a map of one file costs memory
   proportional to its size. A merge-join holds one line per file, so memory stays flat from 10 lines
   to 10 million. Sorted input is the price, and settlement and ledger exports can be produced sorted
@@ -254,6 +257,9 @@ sbt test
 - **`LargeFileSpec`:** 500,000 generated transactions per file reconciled to exactly the expected
   summary, and an **endless** pair of files reconciled lazily (taking 5 results ends the run), which
   would hang if any stage collected its input.
+- **`DependencyVersionsSpec`:** Pekko HTTP accepts the Pekko version on the classpath (same major
+  line, at least the version it requires), so a bump of one without the other fails with a clear
+  message.
 - **`ReconciliationRoutesSpec`:** the NDJSON response and its summary, 400 and 404, and over real
   HTTP: a ~12 MB streamed settlement upload (above the default 8 MB limit) reconciled in full, and a
   raw-socket client that sends its whole ~5 MB upload before reading anything still getting the
@@ -262,7 +268,7 @@ sbt test
 
 ## Tech stack
 
-Scala 3.10 · JDK 25 · Apache Pekko Streams 1.7 · Pekko HTTP 1.4 · circe · munit · sbt · GitHub
+Scala 3.10 · JDK 25 · Apache Pekko Streams 2.0 · Pekko HTTP 2.0 (milestone) · circe · munit · sbt · GitHub
 Actions · Dependabot (sbt and GitHub Actions)
 
 ## License
