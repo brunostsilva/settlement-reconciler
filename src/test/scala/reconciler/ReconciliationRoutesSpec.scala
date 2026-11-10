@@ -36,7 +36,12 @@ class ReconciliationRoutesSpec extends StreamSuite:
       .withoutSizeLimit()
       .dataBytes
       .via(Framing.delimiter(ByteString("\n"), 64 * 1024, allowTruncation = true))
-      .map(line => parse(line.utf8String).fold(error => fail(s"invalid JSON line: $error"), identity))
+      .map(line =>
+        parse(line.utf8String).fold(
+          error => fail(s"${response.status} response, invalid JSON line: ${line.utf8String} ($error)"),
+          identity
+        )
+      )
 
   private def ndjson(response: HttpResponse): Future[Seq[Json]] = runToSeq(lines(response))
 
