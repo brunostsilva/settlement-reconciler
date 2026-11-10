@@ -46,10 +46,11 @@ flowchart LR
     M --> R[results] --> SUM[summary<br/>at the end]
 ```
 
-- **Parse + check order** (`Csv`, `Reconciler.checked`): `Framing.delimiter` splits the bytes into
-  lines whatever the chunk boundaries; each line becomes a `Record` or a `Rejected` result. A
-  repeated id becomes a `Duplicate`, and an id going **backwards** stops the run with an
-  `UnsortedInputException` saying where, since the merge-join depends on sorted input.
+- **Parse + check order** (`Csv`, `Reconciler.checked`): the bytes are split into lines whatever
+  the chunk boundaries, holding at most 1,024 bytes; each line becomes a `Record` or a `Rejected`
+  result (malformed, or longer than 1,024 bytes). A repeated id becomes a `Duplicate`, and an id
+  going **backwards** stops the run with an `UnsortedInputException` saying where, since the
+  merge-join depends on sorted input.
 - **Partition** sends valid records to the merge and issues straight to the output, so a bad line
   never blocks the reconciliation.
 - **MergeSorted** interleaves both files by `(transaction id, side)`: a transaction's ledger record
@@ -61,13 +62,25 @@ flowchart LR
 Backpressure is end to end: a slow consumer (e.g. an HTTP client reading slowly) slows the file
 reads down instead of piling results up.
 
+**A run is only valid if it ends with the summary.** Disorder in a file can show up anywhere, even on
+its last line, and the results before it are already out by then (for example, a ledger listing
+`tx-3` before `tx-2` first reports `tx-2` as missing from the ledger). That's inherent to streaming:
+the alternative would be holding every result back until the end. So a run that stops with an error
+never emits the summary, the HTTP response then has no `end` line, and the CLI exits with status 1:
+whatever was received must be discarded.
+
 ## API
 
 ### `POST /settlements/{date}/reconciliation`
 
 The request body is the acquirer's settlement file for `date` (`YYYY-MM-DD`). The ledger side is the
 company's own export, read from `LEDGER_DIR/ledger-{date}.csv`. The response is **streamed as NDJSON**
-(`application/x-ndjson`, chunked): one JSON object per result while the files are read, then a summary.
+(`application/x-ndjson`, chunked): one JSON object per result, then a summary.
+
+The upload is first written to a temporary file (streamed, with constant memory, and with no size
+limit), then reconciled from disk while the response streams; the file is deleted when the response
+ends. That keeps the request and the response independent, so it works with clients that send the
+whole body before reading the response, such as Python's `requests`.
 
 ```bash
 sbt run    # starts the server on port 8080, with sample-data as LEDGER_DIR
@@ -98,8 +111,8 @@ branch, so their position relative to the paired results may vary.
 | `400` | Invalid date |
 | `404` | No ledger export for that date |
 
-A `200` response **without** the final `end` line was cut short, e.g. by an unsorted file: once a
-stream has started, its status can't change anymore.
+A `200` response **without** the final `end` line was cut short, e.g. by an unsorted file, and its
+results must be discarded: once a stream has started, its status can't change anymore.
 
 **File format:** a `transaction_id,amount,currency` header, then one transaction per line
 (`tx-0001,120.00,BRL`), sorted by `transaction_id`. Amounts have at most two decimal places and are
@@ -113,7 +126,7 @@ Requirements: **JDK 25** and **sbt**.
 sbt test                                   # the whole test suite
 sbt run                                    # the HTTP server (LEDGER_DIR=sample-data, PORT=8080)
 
-# Reconcile two local files from the command line (NDJSON on stdout)
+# Reconcile two local files from the command line (NDJSON on stdout; exit status 1 if the run fails)
 sbt "runMain reconciler.Reconcile sample-data/ledger-2026-11-10.csv sample-data/settlement-2026-11-10.csv"
 
 # Generate a large pair of files (here 5 million transactions each, ~120 MB per file), streamed to disk
@@ -142,16 +155,24 @@ missing from the ledger, every 97th settled one cent off), so the summary can be
 - **Merge-join over sorted files, not a lookup map.** Building a map of one file costs memory
   proportional to its size. A merge-join holds one line per file, so memory stays flat from 10 lines
   to 10 million. Sorted input is the price, and settlement and ledger exports can be produced sorted
-  by id. An unsorted file stops the run with a precise error instead of producing wrong results.
-- **Bad lines don't stop the run.** A malformed line or a duplicate id is reported as a result and
-  skipped: one broken line in a 2 GB file shouldn't hide every other discrepancy. Only an unsorted
-  file, which makes the whole reconciliation meaningless, fails it.
+  by id. An unsorted file stops the run with a precise error (side, line, ids); the results already
+  streamed before the error must be discarded, which the missing summary signals.
+- **Bad lines don't stop the run.** A malformed line, a line longer than 1,024 bytes or a duplicate
+  id is reported as a result and skipped: one broken line in a 2 GB file shouldn't hide every other
+  discrepancy. Lines are split by a small splitter that never buffers more than 1,024 bytes (Pekko's
+  `Framing.delimiter` fails the stream on an overlong line instead). Only an unsorted file, which
+  makes the whole reconciliation meaningless, fails the run.
 - **Results stream out as they're found.** The HTTP response is NDJSON over chunked transfer
   encoding, so a client sees discrepancies while the files are still being read, and the server
   never builds the full result in memory.
-- **No request size limit on this route.** Pekko HTTP limits request bodies to 8 MB by default; the
-  settlement body is streamed, never held in memory, so the limit is lifted for this route only
-  (`withoutSizeLimit`).
+- **The upload goes to disk before it's reconciled.** Reconciling straight from the request body
+  would tie request and response together through backpressure: a client that only reads the
+  response after sending the whole body would deadlock with the server once the network buffers
+  fill. Storing the upload first (streamed, constant memory) costs some latency, since results start
+  after the upload, and works with every client. The default 8 MB request size limit is lifted for
+  this route only (`withoutSizeLimit`), since the body is never held in memory.
+- **Scriptable CLI.** `Reconcile` exits with 0 only when the run completes, 1 when it fails and 2 on
+  wrong usage, so `Reconcile ... > results.ndjson && upload results.ndjson` never ships a partial run.
 - **Money as integer cents.** Amounts are parsed into an opaque `Money` type backed by `Long`, so
   sums and comparisons are exact.
 
@@ -162,15 +183,20 @@ sbt test
 ```
 
 - **`MoneySpec` / `CsvSpec`:** amount parsing, CSV lines split across arbitrary chunk boundaries,
-  CRLF, blank lines, a missing final newline, and every kind of rejected line with its reason.
+  CRLF, blank lines, a missing final newline, every kind of rejected line with its reason, and
+  overlong lines (also split across chunks, or last without a newline) rejected without stopping
+  the run.
 - **`ReconcilerSpec`:** every outcome, files with missing transactions at the start, middle and end,
   an empty file, duplicates and rejected lines alongside the reconciliation, paired results in id
-  order, an unsorted file failing with its line, the summary, and the sample files.
+  order, an unsorted file failing with its line and never emitting the summary, the summary, and the
+  sample files.
 - **`LargeFileSpec`:** 500,000 generated transactions per file reconciled to exactly the expected
   summary, and an **endless** pair of files reconciled lazily (taking 5 results ends the run), which
   would hang if any stage collected its input.
-- **`ReconciliationRoutesSpec`:** the NDJSON response and its summary, 400 and 404, and, over real
-  HTTP, a ~12 MB streamed settlement upload (above the default 8 MB limit) reconciled in full.
+- **`ReconciliationRoutesSpec`:** the NDJSON response and its summary, 400 and 404, and over real
+  HTTP: a ~12 MB streamed settlement upload (above the default 8 MB limit) reconciled in full, and a
+  raw-socket client that sends its whole ~5 MB upload before reading anything still getting the
+  full result.
 
 ## Tech stack
 
