@@ -1,4 +1,4 @@
-ThisBuild / scalaVersion := "3.10.0"
+ThisBuild / scalaVersion := "3.10.1"
 ThisBuild / version      := "0.1.0"
 
 // Pekko HTTP has no final 2.x release yet: 2.0.0-M2 is the latest milestone on Maven Central, built
