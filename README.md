@@ -4,7 +4,7 @@ Streaming **settlement reconciliation** in **Scala 3** with **Apache Pekko Strea
 it reconciles an acquirer's settlement file against the company's own ledger, line by line, with
 **constant memory**, whatever the size of the files.
 
-> Everything runs locally and for free: JDK 25 and sbt are all you need. No database, no Docker,
+> Everything runs locally and for free: JDK 27 and sbt are all you need. No database, no Docker,
 > no API keys. The data is synthetic.
 
 ## The problem
@@ -168,7 +168,7 @@ handled as integer cents, never as floating point.
 
 ## Running locally
 
-Requirements: **JDK 25** and **sbt**.
+Requirements: **JDK 27** and **sbt**.
 
 ```bash
 sbt test                                   # the whole test suite
@@ -275,7 +275,7 @@ sbt test
 
 ## Tech stack
 
-Scala 3.10 · JDK 25 · Apache Pekko Streams 2.0 · Pekko HTTP 2.0 (milestone) · circe · munit · sbt · GitHub
+Scala 3.10 · JDK 27 · Apache Pekko Streams 2.0 · Pekko HTTP 2.0 (milestone) · circe · munit · sbt · GitHub
 Actions · Dependabot (sbt and GitHub Actions)
 
 ## License
