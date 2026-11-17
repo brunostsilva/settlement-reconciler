@@ -4,7 +4,7 @@ ThisBuild / version      := "0.1.0"
 // Pekko HTTP has no final 2.x release yet: 2.0.0-M2 is the latest milestone on Maven Central, built
 // against a Pekko 2.0 milestone and accepted by the final Pekko 2.0.0 (see DependencyVersionsSpec).
 val pekkoVersion     = "2.0.0"
-val pekkoHttpVersion = "2.0.0-M2"
+val pekkoHttpVersion = "2.0.0"
 val circeVersion     = "0.14.17"
 
 lazy val root = (project in file("."))
