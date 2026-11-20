@@ -152,20 +152,25 @@ class ReconciliationRoutesSpec extends StreamSuite:
   }
 
   test("over real HTTP, a 404 sent before the upload ends doesn't break the next request on the same pool") {
-    // The 404 is answered from the date alone, while the client is still streaming a 12 MB upload. With
-    // a single pooled connection, the next request only works if the pool recovers from that early
-    // response.
-    val count = 500_000L
-    val pool  = ConnectionPoolSettings(system).withMaxConnections(1)
+    // The 404 is answered from the date alone, while the client is still uploading: the upload never
+    // ends, so the 404 can only be an early response. With a single pooled connection, the next request
+    // only works if the pool recovers from it, and the unfinished upload must be cancelled.
+    val pool     = ConnectionPoolSettings(system).withMaxConnections(1)
+    val uploaded = Promise[Unit]()
+    val unending = (Generator.settlement(1_000) ++ Source.never[ByteString]).watchTermination { (notUsed, done) =>
+      done.onComplete(_ => uploaded.trySuccess(()))
+      notUsed
+    }
     for
       binding <- Http().newServerAt("127.0.0.1", 0).bind(Route.toFunction(ReconciliationRoutes(ledgerDir()).route))
       base     = s"http://127.0.0.1:${binding.localAddress.getPort}/settlements"
-      upload   = HttpEntity(ContentTypes.`text/csv(UTF-8)`, Generator.settlement(count))
+      upload   = HttpEntity(ContentTypes.`text/csv(UTF-8)`, unending)
       missing <- Http().singleRequest(HttpRequest(HttpMethods.POST, Uri(s"$base/2020-01-01/reconciliation"), entity = upload), settings = pool)
       _       <- missing.discardEntityBytes().future
       settlement = HttpEntity(ContentTypes.`text/csv(UTF-8)`, Files.readAllBytes(Path.of(s"sample-data/settlement-$date.csv")))
       found   <- Http().singleRequest(HttpRequest(HttpMethods.POST, Uri(s"$base/$date/reconciliation"), entity = settlement), settings = pool)
       results <- ndjson(found)
+      _       <- uploaded.future
       _       <- binding.unbind()
     yield
       assertEquals(missing.status, StatusCodes.NotFound)
