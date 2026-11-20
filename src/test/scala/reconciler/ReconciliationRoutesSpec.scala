@@ -3,13 +3,15 @@ package reconciler
 import java.net.Socket
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Path}
-import scala.concurrent.{blocking, Future}
+import scala.concurrent.{blocking, Future, Promise}
 import scala.concurrent.duration.*
 import io.circe.Json
 import io.circe.parser.parse
 import org.apache.pekko.http.scaladsl.Http
 import org.apache.pekko.http.scaladsl.model.*
 import org.apache.pekko.http.scaladsl.server.Route
+import org.apache.pekko.http.scaladsl.settings.ConnectionPoolSettings
+import org.apache.pekko.pattern.after
 import org.apache.pekko.stream.scaladsl.{FileIO, Framing, Sink, Source}
 import org.apache.pekko.util.ByteString
 
@@ -147,6 +149,71 @@ class ReconciliationRoutesSpec extends StreamSuite:
       val expected = Generator.expectedSummary(count)
       assertEquals(summaryOf(last).hcursor.get[Long]("matched").toOption, Some(expected.matched))
       assertEquals(summaryOf(last).hcursor.get[Long]("missingInLedger").toOption, Some(expected.missingInLedger))
+  }
+
+  test("over real HTTP, a 404 sent before the upload ends doesn't break the next request on the same pool") {
+    // The 404 is answered from the date alone, while the client is still uploading: the upload never
+    // ends, so the 404 can only be an early response. With a single pooled connection, the next request
+    // only works if the pool recovers from it, and the unfinished upload must be cancelled.
+    val pool     = ConnectionPoolSettings(system).withMaxConnections(1)
+    val uploaded = Promise[Unit]()
+    val unending = (Generator.settlement(1_000) ++ Source.never[ByteString]).watchTermination { (notUsed, done) =>
+      done.onComplete(_ => uploaded.trySuccess(()))
+      notUsed
+    }
+    for
+      binding <- Http().newServerAt("127.0.0.1", 0).bind(Route.toFunction(ReconciliationRoutes(ledgerDir()).route))
+      base     = s"http://127.0.0.1:${binding.localAddress.getPort}/settlements"
+      upload   = HttpEntity(ContentTypes.`text/csv(UTF-8)`, unending)
+      missing <- Http().singleRequest(HttpRequest(HttpMethods.POST, Uri(s"$base/2020-01-01/reconciliation"), entity = upload), settings = pool)
+      _       <- missing.discardEntityBytes().future
+      settlement = HttpEntity(ContentTypes.`text/csv(UTF-8)`, Files.readAllBytes(Path.of(s"sample-data/settlement-$date.csv")))
+      found   <- Http().singleRequest(HttpRequest(HttpMethods.POST, Uri(s"$base/$date/reconciliation"), entity = settlement), settings = pool)
+      results <- ndjson(found)
+      _       <- uploaded.future
+      _       <- binding.unbind()
+    yield
+      assertEquals(missing.status, StatusCodes.NotFound)
+      assertEquals(found.status, StatusCodes.OK)
+      assertEquals(summaryOf(results.last).hcursor.get[Long]("matched").toOption, Some(3L))
+  }
+
+  test("over real HTTP, a graceful shutdown during an upload still sends the whole reconciliation") {
+    // The route only responds once the upload is stored, so a shutdown that starts mid-upload finds the
+    // response pending, and Pekko HTTP sends it in full, with `Connection: close`. (A response that had
+    // already started streaming would be cut, see akka/akka-http#3209.)
+    val count   = 200_000L
+    val dir     = Files.createTempDirectory("graceful-shutdown")
+    val arrived = Promise[Unit]()
+    val gate    = Promise[Unit]()
+    val handler = Route.toFunction(ReconciliationRoutes(dir).route)
+    // The first half of the upload, then the rest once the gate opens.
+    val upload = Source
+      .futureSource(Generator.settlement(count).runWith(Sink.seq).map { chunks =>
+        val (head, tail) = chunks.splitAt(chunks.size / 2)
+        Source(head) ++ Source.future(gate.future).flatMapConcat(_ => Source(tail))
+      })
+    for
+      _        <- Generator.ledger(count).runWith(FileIO.toPath(dir.resolve(s"ledger-$date.csv")))
+      binding  <- Http().newServerAt("127.0.0.1", 0).bind(request => { arrived.trySuccess(()); handler(request) })
+      uri       = s"http://127.0.0.1:${binding.localAddress.getPort}/settlements/$date/reconciliation"
+      request   = HttpRequest(HttpMethods.POST, Uri(uri), entity = HttpEntity(ContentTypes.`text/csv(UTF-8)`, upload))
+      pending   = Http().singleRequest(request)
+      _        <- arrived.future
+      terminated = binding.terminate(hardDeadline = 1.minute)
+      // Gives the connection time to receive the termination signal before the upload ends.
+      _        <- after(1.second)(Future(gate.success(())))
+      response <- pending
+      (lineCount, last) <- lines(response).runFold((0L, Json.Null))((acc, line) => (acc._1 + 1, line))
+      _                 <- terminated
+    yield
+      assertEquals(response.status, StatusCodes.OK)
+      assertEquals(response.header[headers.Connection].map(_.tokens), Some(Seq("close")))
+      val expected     = Generator.expectedSummary(count)
+      val transactions = expected.matched + expected.discrepancies + expected.missingInSettlement + expected.missingInLedger
+      assertEquals(last.hcursor.get[Boolean]("end").toOption, Some(true))
+      assertEquals(summaryOf(last).hcursor.get[Long]("matched").toOption, Some(expected.matched))
+      assertEquals(lineCount, transactions + 1)
   }
 
   test("a client that sends the whole upload before reading the response still gets the full result") {
